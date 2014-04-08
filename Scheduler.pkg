@@ -1,0 +1,718 @@
+create or replace
+package body sms_sched as
+  -- ---------------------------------------------------------------------------
+  -- function untuk menampilkan job list
+  function  url return varchar2 as
+  begin
+    return 'http://192.168.120.146:9977/';
+  end url;
+
+  -- ---------------------------------------------------------------------------
+  -- Function untuk mendapatkan nilai hexadecimal dari NDS Sequence
+  function post(url varchar2, param varchar2) return varchar2 as
+  language java
+  name 'http.post(java.lang.String, java.lang.String) return java.lang.String';
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan job list
+  function  cmd_list(p_page number default 1,
+                     p_type number default null,
+                     p_cat number default null,
+                     p_name varchar2 default null)  return xr AS
+    x xr;
+    v_sql varchar2(3048);
+    v_where varchar(1024) default '1=1 ';
+    v_z number default 25;
+    v_x number default 1;
+    v_y number default 10;
+  begin
+    v_y := v_z*p_page;
+    v_x := v_y - v_z +1;
+
+    if p_type is not null then
+      v_where := v_where || q'{ and j.cmd_type = }'|| p_type;
+    end if;
+
+    if p_cat is not null then
+      v_where := v_where || q'{ and j.cmd_category = }'|| p_cat;
+    end if;
+
+    if p_name is not null then
+      v_where := v_where || q'{ and j.cmd_name like '%}'|| upper(p_name) || q'{%'}';
+    end if;
+    v_sql := q'[select xmlelement("JOBS",
+                    xmlforest(row_id
+                            , cmd_id
+                            , cmd_name
+                            , cmd_type
+                            , cmd_cat
+                            , params
+                            , description
+                            , signature
+                    )) as xml from (
+                    select  row_number() over (order by wm_concat(param_name)) as row_id
+                            , cmd_id
+                            , cmd_name
+                            , type_scheduler_code as cmd_type
+                            , category_scheduler_code as cmd_cat
+                            , wm_concat(param_name) as params
+                            , description
+                            , up_sign as signature
+                      from (
+                      select j.cmd_id
+                           , j.cmd_name
+                           , t.type_scheduler_code
+                           , k.category_scheduler_code
+                           , p.param_name
+                           , j.description
+                           , j.up_sign
+                        from scheduler_command j
+                        left join sms_m_scheduler_category k
+                          on j.cmd_category = k.category_scheduler_id
+                        left join sms_m_scheduler_type t
+                          on j.cmd_type = t.type_scheduler_id
+                        left outer join scheduler_cmd_param c
+                          on c.cmd_id = j.cmd_id
+                        left outer join scheduler_param p
+                          on c.param_id = p.param_id
+                       where ]' || v_where || q'[
+                      order by c.cmd_id, c.param_order
+                      )
+                      group by cmd_id, cmd_name, type_scheduler_code, category_scheduler_code, description, up_sign
+                      order by wm_concat(param_name), cmd_id)
+                      where 1=1 -- row_id between ]' || to_char(v_x) || q'[ and ]' || to_char(v_y);
+    EXECUTE IMMEDIATE v_sql
+    BULK COLLECT INTO x;
+    return x;
+  END cmd_list;
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan job list
+  function  get_job_type return xr as
+    x xr;
+    v_sql varchar2(2048);
+  begin
+     v_sql := q'[select xmlelement("TYPE",
+                    xmlforest(category_scheduler_id
+                            , category_scheduler_code
+                    )) as xml
+                    from sms_m_scheduler_category
+                   where category_scheduler_id in (201,202,204)
+                   order by category_scheduler_id]';
+
+    EXECUTE IMMEDIATE v_sql
+
+    BULK COLLECT INTO x;
+    return x;
+  end get_job_type;
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan detail job
+  function  job_detail(p_job_id number) return xmltype as
+    result xmltype;
+  begin
+    select xmlelement("JOB",
+        xmlforest(
+          cmd_id,
+          cmd_name,
+          cmd_type,
+          cmd_category,
+          cmd_sql,
+          cmd_sql_ex,
+          up_sign,
+          description
+        )
+      ) into result
+    from scheduler_command
+    where cmd_id = p_job_id;
+    RETURN result;
+  end job_detail;
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan param list
+  function  get_params(p_job_id number default null) return xr as
+    x xr;
+    v_sql varchar2(2048);
+    v_where varchar2(512) default '';
+  begin
+    if p_job_id is not null then
+      v_where := q'{ where status = '1' and param_id not in (
+                      select param_id from scheduler_cmd_param
+                       where cmd_id = }' || p_job_id || q'{
+                     ) }';
+    end if;
+    v_sql := q'[select xmlelement("TYPE",
+                    xmlforest(p.param_id,
+                              p.param_name,
+                              decode(p.data_src,
+                                     'U', 'User',
+                                     'F', 'File') as ds,
+                              decode(p.data_type,
+                                     'I', 'Integer',
+                                     'D', 'Date',
+                                     'S', 'String') as type
+                    )) as xml
+                    from scheduler_param p
+                    ]' || v_where || q'[
+                    order by param_name]';
+
+    EXECUTE IMMEDIATE v_sql
+    BULK COLLECT INTO x;
+    return x;
+  end get_params;
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan param list dari job
+  function  get_job_params(p_job_id number) return xr as
+    x xr;
+    v_sql varchar2(2048);
+  begin
+     v_sql := q'[select xmlelement("PARAM",
+                    xmlforest(p.param_id,
+                              p.param_name,
+                              decode(p.data_src,
+                                     'U', 'User',
+                                     'F', 'File') as ds,
+                              decode(p.data_type,
+                                     'I', 'Integer',
+                                     'D', 'Date',
+                                     'S', 'String') as type,
+                              c.param_order
+                    )) as xml
+                    from scheduler_param p
+                    left outer join scheduler_cmd_param c
+                    on p.param_id = c.param_id
+                    where p.status = '1' and c.cmd_id = ]' || p_job_id ||  q'[
+                    order by param_order]';
+
+    EXECUTE IMMEDIATE v_sql
+    BULK COLLECT INTO x;
+    return x;
+  end get_job_params;
+
+  ------------------------------------------------------------------------------
+  -- function untuk menampilkan param list dari job
+  function  last_command_id return number as
+    result number;
+  begin
+    /*
+    -- karena sudah table baru, last_command_id diambil dari sequence
+    -- ari (2013-08-12)
+    select max(cmd_id) into result
+    from scheduler_command;
+
+    return result+1;
+    */
+
+    select scheduler_command_id.nextval into result from dual;
+    return result;
+  end last_command_id;
+
+  ------------------------------------------------------------------------------
+  -- function untuk membentuk parameter job
+  function  build_job_param(p_job_id number) return varchar2 as
+    result varchar2(1024);
+  begin
+    null;
+  end build_job_param;
+
+  ------------------------------------------------------------------------------
+  -- procedure untuk simpan hasil konfigurasi job scheduler
+  procedure save_config(p_id number,
+                        p_name varchar2,
+                        p_type number,
+                        p_cat number,
+                        p_sql varchar2,
+                        p_sql_ex varchar2,
+                        p_desc varchar2,
+                        p_up_sign varchar2,
+                        p_params varchar2,
+                        p_order varchar,
+                        p_user number,
+                        po_status out integer,
+                        po_message out varchar2) as
+    v_id number;
+    v_ins number default 0;
+    v_url varchar2(255);
+    resp varchar(1024);
+    v_module_id number;
+    v_row_id number;
+    v_cmd_name varchar(100);
+  begin
+    
+    select module_id
+      into v_module_id
+      from mnc_subscribe.app_modules
+     where controller = 'scheduler-job_scheduler';
+    
+    select ID
+      into v_row_id
+      from (select ID from APP_PRIVILEGE_MODULE_EXT2 order by ID desc)
+     where rownum = 1;
+    
+    v_row_id := v_row_id + 1;  
+  
+    if p_id is null then
+      -- insert new
+      v_ins := 1;
+      v_id := last_command_id();
+      dbms_output.put_line(v_id);
+      insert into scheduler_command (
+         cmd_id
+        ,cmd_name
+        ,cmd_type
+        ,cmd_category
+        ,cmd_sql
+        ,cmd_sql_ex
+        ,description
+        ,up_sign
+        ,created_by
+        ,created_date
+      ) values (
+         v_id
+        ,p_name
+        ,p_type
+        ,p_cat
+        ,p_sql
+        ,p_sql_ex
+        ,p_desc
+        ,p_up_sign
+        ,p_user
+        ,sysdate
+      );
+      
+      /*Penambahan Priv Oleh Kiki 20131002*/
+      insert into APP_PRIVILEGE_MODULE_EXT2
+        (ID,
+         MODULE_ID,
+         APP_GROUP_ID,
+         APP_USER_ID,
+         PRV_DYN_PARAMS1,
+         PRV_DYN_PARAMS2,
+         DATE_CREATE,
+         CREATE_BY,
+         UPDATE_BY,
+         UPDATE_DATE,
+         PRV_DYN_NAME,
+         LABEL)
+      values
+        (v_row_id,
+         v_module_id,
+         9994,
+         null,
+         p_name,
+         'false',
+         sysdate,
+         p_user,
+         null,
+         null,
+         null,
+         p_name);
+     /*End Penambahan Priv Oleh Kiki 20131002*/
+      
+    else
+      -- update existing
+      v_id := p_id;
+      
+      select cmd_name
+        into v_cmd_name
+        from scheduler_command
+       where cmd_id = v_id;
+
+      update scheduler_command set
+         cmd_name = p_name
+        ,cmd_type = p_type
+        ,cmd_category = p_cat
+        ,cmd_sql = p_sql
+        ,cmd_sql_ex = p_sql_ex
+        ,description = p_desc
+        ,up_sign = p_up_sign
+        ,updated_by = p_user
+        ,updated_date = sysdate
+      where cmd_id = v_id;
+      
+      /*Penambahan Priv Oleh Kiki 2 10 2013*/
+      update APP_PRIVILEGE_MODULE_EXT2 set
+         PRV_DYN_PARAMS1 = p_name
+        ,UPDATE_BY = p_user
+        ,UPDATE_DATE = sysdate
+        ,LABEL = p_name
+      where PRV_DYN_PARAMS1 = v_cmd_name and MODULE_ID = v_module_id;
+      /*End Penambahan Priv Oleh Kiki 2 10 2013*/
+
+      delete
+      from scheduler_cmd_param
+      where cmd_id = v_id;
+
+    end if;
+
+    if p_order is not null then
+      for i in (select rownum as row_id
+        , regexp_substr(p_params,'[^;]+', 1, level) as param
+        , regexp_substr(p_order,'[^;]+', 1, level) as order_param
+                from dual
+                connect by regexp_substr(p_params, '[^;]+', 1, level) is not null
+                and regexp_substr(p_order, '[^;]+', 1, level) is not null) loop
+        insert into scheduler_cmd_param (
+          cmd_id,
+          param_id,
+          param_order,
+          created_by,
+          created_date
+        ) values (
+          v_id,
+          i.param,
+          i.order_param,
+          p_user,
+          sysdate
+        );
+      end loop;
+    end if;
+    commit;
+    po_status := 1;
+    po_message := 'Job config saved';
+    if v_ins = 1 then
+      po_message := 'New job config saved with ID: ' || to_char(v_id);
+    end if;
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+  end save_config;
+
+  ------------------------------------------------------------------------------
+  -- procedure untuk remove job command scheduler
+  procedure remove_cmd(p_id number,
+                       p_user number,
+                       po_status out integer,
+                       po_message out varchar2) as
+    resp varchar2(255);
+  begin
+    delete from scheduler_cmd_param
+     where cmd_id = p_id;
+
+    delete from scheduler_command
+     where cmd_id = p_id;
+
+    commit;
+    if sql%notfound then
+      po_status := 0;
+      po_message := 'Job command ' || to_char(p_id) || ' not found';
+    else
+      po_status := 1;
+      po_message := 'Job command ' || to_char(p_id) || ' deleted';
+    end if;
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+  end remove_cmd;
+
+  -- procedure untuk setup parameter
+  procedure setup_param(p_id number,
+                        p_name varchar2,
+                        p_type varchar2,
+                        p_ds varchar2,
+                        p_user number,
+                        po_status out integer,
+                        po_message out varchar2) as
+    v_id number;
+  begin
+    po_status := 1;
+    if p_id is null then
+      select sms_m_scheduler_params_seq.nextval into v_id from dual;
+      insert into scheduler_param (
+        param_id,
+        param_name,
+        data_type,
+        data_src,
+        created_by,
+        created_date
+      ) values (
+        v_id,
+        p_name,
+        p_type,
+        p_ds,
+        p_user,
+        sysdate
+      );
+      po_message := 'Param saved with new Id: ' || to_char(v_id);
+    else
+      update scheduler_param set
+        param_name    = p_name,
+        data_type     = p_type,
+        data_src     = p_ds,
+        updated_by   = p_user,
+        updated_date = sysdate
+       where param_id = p_id;
+      po_message := 'Param saved';
+    end if;
+    commit;
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+  end setup_param;
+
+  -- procedure untuk setup parameter
+  procedure remove_param(p_id number,
+                         p_user number,
+                         po_status out integer,
+                         po_message out varchar2) as
+  begin
+    update scheduler_param set
+      status = '0',
+      updated_by = p_user,
+      updated_date = sysdate
+    where param_id = p_id;
+    commit;
+    po_status := 1;
+    po_message := 'Param removed';
+
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+  end remove_param;
+
+  procedure add_job(p_name varchar2,
+                    p_cmd_id number,
+                    p_notes varchar2,
+                    p_started_on varchar2,
+                    p_repeat varchar2,
+                    p_interval varchar2,
+                    p_until varchar2,
+                    p_user number,
+                    p_params varchar2,
+                    po_status out integer,
+                    po_message out varchar2) as
+    v_id number;
+    v_ins number default 0;
+    v_url varchar2(255);
+    v_started_on varchar2(25);
+    resp varchar(1024);
+    p_id number;
+    p_val varchar2(100);
+    x number := 1;
+    v_post_param varchar2(2048) := '';
+    v_cond varchar(2248);
+    v_resp varchar2(1024);
+  begin
+    select seq_scheduler_job.nextval into v_id from dual;
+    -- isi job header
+    if p_started_on = 'now' then
+      select to_char(sysdate,'yyyy-mm-dd hh24:mi:ss') into v_started_on from dual;
+    else
+      v_started_on := p_started_on || ':00';
+    end if;
+    insert into scheduler_job (
+     job_id
+    ,job_name
+    ,cmd_id
+    ,notes
+    ,started_on
+    ,repeat
+    ,repeat_interval
+    ,repeat_until
+    ,created_by
+    ,created_date
+    ) values (
+     v_id
+    ,p_name
+    ,p_cmd_id
+    ,p_notes
+    ,v_started_on
+    ,p_repeat
+    ,p_interval
+    ,p_until
+    ,p_user
+    ,sysdate
+    );
+    v_post_param := 'job_id=' || v_id || '&start=' || p_started_on;
+    -- isi job param
+    -- dipastikan parameter masukan sudah bersih dari PHP nya
+    for i in (select regexp_substr(p_params,'[^;]+', 1, level) as param
+              from dual connect by regexp_substr(p_params, '[^;]+', 1, level) is not null) loop
+      for j in (select rownum as rid, regexp_substr(i.param,'[^=]+', 1, level) as param
+              from dual connect by regexp_substr(i.param, '[^=]+', 1, level) is not null) loop
+        if mod(j.rid, 2) = 1 then
+          p_id := j.param;
+        else
+          p_val := j.param;
+        end if;
+      end loop;
+      if p_id is not null then
+        insert into scheduler_job_param values (
+          v_id
+         ,p_id
+         ,p_val
+         ,p_user
+         ,sysdate
+        );
+      end if;
+      x := x+1;
+      p_id  := null;
+      p_val := null;
+    end loop;
+    v_cond := f_scheduler_condition(v_id);
+    update scheduler_job set
+      condition = v_cond
+     ,post_param = v_post_param
+    where job_id = v_id;
+    commit;
+    v_resp := post(url(),v_post_param);
+    po_status := 1;
+    po_message := 'New job saved with ID: ' || to_char(v_id);
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+    null;
+  end add_job;
+
+  procedure start_job(p_job_id number,
+                      p_pid number) as
+  begin
+    insert into scheduler_job_process (
+      job_id,
+      pid,
+      status,
+      runtime
+    )values(
+      p_job_id,
+      p_pid,
+      9, -- started
+      sysdate
+    );
+    commit;
+  end start_job;
+
+  function  set_next(p_job_id number) return varchar2 as
+    result varchar2(20);
+    ival varchar2(100);
+    v_next varchar2(100);
+    v_sql varchar2(1024);
+    v_i number;
+    v_j varchar2(20);
+    v_k varchar2(2);
+  begin
+    select decode(substr(repeat_interval,-1,1),
+            'i','minute',
+            'h','hour',
+            'd','day',
+            'w','day',
+            'm','month',
+            'y','year'
+         ),
+         substr(repeat_interval,-1,1),
+         substr(repeat_interval,1,length(repeat_interval)-1)
+    into v_j, v_k, v_i
+    from scheduler_job where job_id = p_job_id;
+
+    if v_k = 'w' then
+      v_i := v_i * 7;
+    end if;
+    ival := q'{'}' || v_i || q'{' }' || v_j;
+
+    v_sql := q'{
+    begin
+      select case when to_char(sysdate,'yyyy-mm-dd hh24:mi:ss')
+             between to_char(lr,'yyyy-mm-dd hh24:mi:ss') and to_char(nr,'yyyy-mm-dd hh24:mi:ss')
+             then to_char(nr,'yyyy-mm-dd hh24:mi:ss')
+             else to_char(sysdate + interval  }' || ival || q'{,'yyyy-mm-dd hh24:mi:ss')  end into :1
+          from
+          (select max(runtime) + interval }' || ival || q'{ as nr,
+                  max(runtime) as lr
+            from scheduler_job_process a,
+                 scheduler_job b
+           where a.job_id = b.job_id
+             and a.job_id = }' || p_job_id || q'{);
+      end;}';
+    execute immediate v_sql
+    using out result;
+
+    return result;
+  end set_next;
+
+  procedure push_next(p_job_id number) as
+    v_sql varchar2(512);
+    jr scheduler_job%rowtype;
+    go_next number := 0;
+    v_post_param varchar2(100);
+    v_resp varchar2(100);
+  begin
+    select * into jr from scheduler_job where job_id = p_job_id;
+    if jr.repeat = '1' then
+      -- push next queue
+      select case when repeat_until < to_char(sysdate,'yyyy-mm-dd hh24:mi:ss')
+             then 0 else 1 end into go_next
+        from scheduler_job
+       where job_id = p_job_id;
+
+        -- insert into sx_temp values (p_job_id, set_next(p_job_id)); commit;
+      if go_next = 1 then
+        v_post_param := 'job_id=' || p_job_id || '&start=' || set_next(p_job_id);
+        v_resp := post(url(),v_post_param);
+      end if;
+    end if;
+  end push_next;
+
+  procedure end_job(p_job_id number,
+                    p_pid number,
+                    p_status varchar2,
+                    p_message varchar2,
+                    p_file varchar2) as
+  begin
+    update scheduler_job_process set
+      endtime = sysdate,
+      status  = p_status,
+      message = p_message,
+      result_file = p_file
+    where job_id = p_job_id
+      and pid = p_pid;
+    commit;
+    -- set next queue
+    push_next(p_job_id);
+  end end_job;
+
+  procedure kill_job(p_job_id number,
+                     p_pid number,
+                     p_user number,
+                     po_status out integer,
+                     po_message out varchar2) as
+    v_resp varchar2(50);
+  begin
+    v_resp := post(url()||'kill','job_id='||p_job_id||'1='||p_pid);
+    update scheduler_job_process set
+      endtime = sysdate,
+      status  = 2,
+      message = 'Interrupted by user'
+    where job_id = p_job_id
+      and pid = p_pid
+      and status = 9;
+    commit;
+
+    po_status := 1;
+    po_message := 'Job interrupted';
+  exception when others then
+    rollback;
+    po_status := 0;
+    po_message := SQLERRM;
+  end kill_job;
+
+  procedure repush is
+    v_resp varchar2(1024);
+    v_post_param varchar2(100);
+  begin
+    for x in (select job_id, to_char(sysdate,'yyyy-mm-dd ') || substr(started_on,-8) as push_time
+                from scheduler_job
+               where (started_on > to_char(sysdate,'yyyy-mm-dd hh24:mi:ss')) or
+                     (repeat = '1' and
+                      repeat_until > to_char(sysdate,'yyyy-mm-dd hh24:mi'))
+              ) loop
+      v_post_param := 'job_id=' || x.job_id || '&start=' || x.push_time;
+      v_resp := post(url(),v_post_param);
+    end loop;
+  end repush;
+
+END SMS_SCHED;
